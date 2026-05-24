@@ -817,6 +817,44 @@ class TestScaling:
             assert [float(x) for x in dest1[2:6]] == [20.0, 40.0, 60.0, 80.0]
 
 
+    def test_annotation_coordinate_scaling_and_p_removal(self):
+        """Test scaling of all auxiliary coordinate types and removal of the /P key."""
+        src = make_pdf(1)
+        annot = make_goto_action_annot(src, 0)
+        
+        # Populate all coordinate types handled by scale_annot_coords
+        annot.QuadPoints = pikepdf.Array([10, 10, 20, 20, 30, 30, 40, 40])
+        annot.Vertices = pikepdf.Array([5, 5, 15, 15])
+        annot.CL = pikepdf.Array([1, 2, 3])
+        annot.InkList = pikepdf.Array([pikepdf.Array([1, 2]), pikepdf.Array([3, 4])])
+        
+        # Inject a raw string to force survival through copy_foreign, hitting line 273
+        annot.P = pikepdf.String("stale-p-ref")
+        
+        add_annots(src, 0, [annot])
+        src = roundtrip(src)
+        
+        out = make_pdf(1)
+        row = Row(1, 1)
+        row.scale = 2.0  # Trigger scale factor != 1.0
+        
+        run_rebuild_links([src], out, [row])
+        out = roundtrip(out)
+        
+        annots = get_annots(out, 0)
+        assert len(annots) == 1
+        new_annot = annots[0]
+        
+        # Verify all coordinate dimensions were scaled properly
+        assert list(new_annot.QuadPoints) == [20.0, 20.0, 40.0, 40.0, 60.0, 60.0, 80.0, 80.0]
+        assert list(new_annot.Vertices) == [10.0, 10.0, 30.0, 30.0]
+        assert list(new_annot.CL) == [2.0, 4.0, 6.0]
+        assert list(new_annot.InkList[0]) == [2.0, 4.0]
+        assert list(new_annot.InkList[1]) == [6.0, 8.0]
+        
+        # Verify old page reference key was dropped and replaced with the new page obj
+        assert new_annot.P == out.pages[0].obj
+
 # ---------------------------------------------------------------------------
 # Tests: Outline styles and open/closed state
 # ---------------------------------------------------------------------------
@@ -941,12 +979,23 @@ def get_annots(pdf: pikepdf.Pdf, page_idx: int) -> list:
     return list(page.Annots)
 
 
+def simulate_append_page(pdf_input, pdf_output, pages):
+    """Pre-populate out_page.Annots as _append_page does, before rebuild_links."""
+    for row in pages:
+        file_idx = row.nfile - 1
+        src_page = pdf_input[file_idx].pages[row.npage - 1]
+        out_page = pdf_output.pages[pages.index(row)]
+        if pikepdf.Name.Annots in src_page:
+            pdf_temp = pikepdf.Pdf.new()
+            pdf_temp.pages.append(src_page)
+            indirect_annots = pdf_temp.make_indirect(pdf_temp.pages[0].Annots)
+            out_page.Annots = pdf_output.copy_foreign(indirect_annots)
+
+
 def run_rebuild_links(pdf_input, pdf_output, pages):
-    """Convenience: construct remapper and call rebuild_links."""
+    simulate_append_page(pdf_input, pdf_output, pages)
     remapper = OutlineRemapper(pdf_input, pdf_output, pages)
     rebuild_links(pdf_input, pdf_output, pages, remapper)
-
-
 # ---------------------------------------------------------------------------
 # Basic GoTo action link tests
 # ---------------------------------------------------------------------------
@@ -1137,7 +1186,7 @@ class TestPassthroughAnnotations:
             A=pikepdf.Dictionary(
                 S=pikepdf.Name.GoToR,
                 F=pikepdf.String("other.pdf"),
-                D=pikepdf.Array([pikepdf.Integer(0), pikepdf.Name.Fit]),
+                D=pikepdf.Array([0, pikepdf.Name.Fit]),
             ),
         )
         add_annots(src, 0, [gotor])
@@ -1192,7 +1241,22 @@ class TestNoAnnotations:
         assert get_annots(out, 0) == []
         assert len(get_annots(out, 1)) == 1
 
-
+    def test_stale_output_annots_deleted_when_source_has_none(self):
+        """Line 301: Output page /Annots gets cleared if the source page has no annotations."""
+        src = make_pdf(1)  # Clean source page with no annotations
+        src = roundtrip(src)
+        
+        out = make_pdf(1)
+        # Pre-populate the output page manually with a dummy annotation entry
+        stale_annot = out.make_indirect(make_non_link_annot())
+        out.pages[0].Annots = pikepdf.Array([stale_annot])
+        
+        # Run rebuild_links directly to step into the target branch code path
+        remapper = OutlineRemapper([src], out, [Row(1, 1)])
+        rebuild_links([src], out, [Row(1, 1)], remapper)
+        
+        # Ensure the stale annotations array has been deleted completely
+        assert pikepdf.Name.Annots not in out.pages[0]
 # ---------------------------------------------------------------------------
 # Duplicate pages
 # ---------------------------------------------------------------------------
