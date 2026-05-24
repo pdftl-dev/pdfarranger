@@ -190,9 +190,8 @@ def write_named_dests(pdf, named_dests):
 
 
 def rebuild_outlines(pdf_input, pdf_output, pages):
-    """Rebuild outlines in pdf_output by remapping bookmarks from pdf_input."""
+    """Rebuild outlines and internal links in pdf_output."""
     remapper = OutlineRemapper(pdf_input, pdf_output, pages)
-    # preserve first-appearance order of source files, deduplicated
     ordered_file_indices = list(dict.fromkeys(row.nfile - 1 for row in pages))
     with pdf_output.open_outline() as new_outline:
         for file_idx in ordered_file_indices:
@@ -208,5 +207,57 @@ def rebuild_outlines(pdf_input, pdf_output, pages):
                 warnings.warn(
                     f"Failed to copy bookmarks from document {file_idx + 1}: {e}"
                 )
+    rebuild_links(pdf_input, pdf_output, pages, remapper)  # <-- new
     if remapper.new_named_dests:
         write_named_dests(pdf_output, remapper.new_named_dests)
+
+
+def rebuild_links(pdf_input, pdf_output, pages, remapper):
+    """Remap internal GoTo link annotations, reading from source pages."""
+    for out_idx, row in enumerate(pages):
+        file_idx = row.nfile - 1
+        src_page = pdf_input[file_idx].pages[row.npage - 1]
+        if pikepdf.Name.Annots not in src_page:
+            continue
+        new_annots = []
+        for annot in src_page.Annots:
+            if annot.get(pikepdf.Name.Subtype) != pikepdf.Name.Link:
+                new_annots.append(
+                    pdf_output.copy_foreign(pdf_input[file_idx].make_indirect(annot))
+                )
+                continue
+            dest = None
+            is_action_based = False
+            if pikepdf.Name.A in annot:
+                action = annot.A
+                if action.get(pikepdf.Name.S) == pikepdf.Name.GoTo:
+                    dest = action.get(pikepdf.Name.D)
+                    is_action_based = True
+            elif pikepdf.Name.Dest in annot:
+                dest = annot.Dest
+            if dest is None:
+                # Non-GoTo action (URI, GoToR, etc.) — keep as-is
+                new_annots.append(
+                    pdf_output.copy_foreign(pdf_input[file_idx].make_indirect(annot))
+                )
+                continue
+            new_dest = remapper.remap_destination(file_idx, dest)
+            if new_dest is None:
+                continue
+            new_annot = pikepdf.Dictionary(
+                pdf_output.copy_foreign(pdf_input[file_idx].make_indirect(annot))
+            )
+            if is_action_based:
+                new_action = pikepdf.Dictionary(new_annot.A)
+                new_action[pikepdf.Name.D] = new_dest
+                new_annot[pikepdf.Name.A] = new_action
+            else:
+                new_annot[pikepdf.Name.Dest] = new_dest
+            new_annots.append(new_annot)
+        out_page = pdf_output.pages[out_idx]
+        if new_annots:
+            for a in new_annots:
+                a[pikepdf.Name.P] = out_page.obj
+            out_page.Annots = pikepdf.Array(new_annots)
+        elif pikepdf.Name.Annots in out_page:
+            del out_page.Annots
